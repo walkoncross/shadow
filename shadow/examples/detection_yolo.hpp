@@ -10,30 +10,31 @@ class DetectionYOLO final : public Method {
   DetectionYOLO() = default;
   ~DetectionYOLO() override { Release(); }
 
-  void Setup(const std::string &model_file, const VecInt &classes,
-             const VecInt &in_shape) override;
+  void Setup(const VecString &model_files, const VecInt &in_shape) override;
 
   void Predict(const JImage &im_src, const VecRectF &rois,
-               std::vector<VecBoxF> *Bboxes) override;
+               std::vector<VecBoxF> *Gboxes,
+               std::vector<std::vector<VecPointF>> *Gpoints) override;
 #if defined(USE_OpenCV)
   void Predict(const cv::Mat &im_mat, const VecRectF &rois,
-               std::vector<VecBoxF> *Bboxes) override;
+               std::vector<VecBoxF> *Gboxes,
+               std::vector<std::vector<VecPointF>> *Gpoints) override;
 #endif
 
   void Release() override;
 
  private:
-  void Process(const float *data, std::vector<VecBoxF> *Bboxes);
+  void Process(const VecFloat &in_data, std::vector<VecBoxF> *Gboxes);
 
   void ConvertDetections(float *data, float *biases, int classes, int num_km,
                          int side, float threshold, VecBoxF *boxes);
 
   Network net_;
   VecFloat in_data_, out_data_, biases_;
+  std::string out_str_;
   int batch_, in_num_, in_c_, in_h_, in_w_, out_num_, out_hw_;
   int num_classes_, num_km_;
   float threshold_;
-  JImage im_ini_;
 };
 
 }  // namespace Shadow

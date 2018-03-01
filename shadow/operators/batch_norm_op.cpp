@@ -1,50 +1,16 @@
 #include "batch_norm_op.hpp"
-#include "core/blas.hpp"
 
 namespace Shadow {
-
-void BatchNormOp::Setup() {
-  use_global_stats_ = get_single_argument<bool>("use_global_stats", true);
-  eps_ = get_single_argument<float>("eps", 1e-5);
-  if (bottoms<float>(0)->num_axes() == 1) {
-    channels_ = 1;
-  } else {
-    channels_ = bottoms<float>(0)->shape(1);
-  }
-
-  if (use_global_stats_ && blobs_size() == 0) {
-    for (int i = 0; i < 3; ++i) {
-      add_blobs<float>(op_name_ + "_param_" + Util::to_string(i));
-    }
-    auto *blob_mean = mutable_blobs<float>(0);
-    auto *blob_variance = mutable_blobs<float>(1);
-    auto *blob_scale = mutable_blobs<float>(2);
-    blob_mean->reshape({1, channels_});
-    blob_variance->reshape({1, channels_});
-    blob_scale->reshape({1, 1});
-    Blas::Set(blob_mean->count(), 0, blob_mean->mutable_data(), 0);
-    Blas::Set(blob_variance->count(), 1, blob_variance->mutable_data(), 0);
-    Blas::Set(blob_scale->count(), 1, blob_scale->mutable_data(), 0);
-    DLOG(WARNING) << "Mean, variance and scale params are initialized with the "
-                     "default values 0, 1 and 1";
-  }
-
-  if (use_global_stats_) {
-    CHECK_EQ(blobs_size(), 3);
-    CHECK_EQ(blobs<float>(2)->count(), 1);
-  }
-}
 
 void BatchNormOp::Reshape() {
   const auto *bottom = bottoms<float>(0);
   auto *top = mutable_tops<float>(0);
 
-  int batch = bottom->shape(0), in_h = bottom->shape(2),
-      in_w = bottom->shape(3);
+  int batch = bottom->shape(0);
 
   top->reshape(bottom->shape());
 
-  spatial_dim_ = in_h * in_w;
+  spatial_dim_ = bottom->count(2);
 
   mean_ = op_ws_->CreateBlob<float>(op_name_ + "_mean");
   variance_ = op_ws_->CreateBlob<float>(op_name_ + "_variance");
@@ -63,7 +29,7 @@ void BatchNormOp::Reshape() {
 
   sum_spatial_multiplier_ =
       op_ws_->CreateBlob<float>(op_name_ + "_sum_spatial_multiplier");
-  sum_spatial_multiplier_->reshape({1, 1, in_h, in_w});
+  sum_spatial_multiplier_->reshape({1, 1, spatial_dim_});
   Blas::Set(spatial_dim_, 1, sum_spatial_multiplier_->mutable_data(), 0);
 
   DLOG(INFO) << op_name_ << "(" << op_type_ << "): " << bottom->name()
@@ -127,10 +93,6 @@ void BatchNormOp::Forward() {
                   0, 0, temp_->mutable_data(), 0);
   Blas::Div(top->count(), top->data(), 0, temp_->data(), 0, top->mutable_data(),
             0);
-}
-
-void BatchNormOp::Release() {
-  // DLOG(INFO) << "Free BatchNormOp!";
 }
 
 REGISTER_OPERATOR(BatchNorm, BatchNormOp);

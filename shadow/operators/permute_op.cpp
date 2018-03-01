@@ -1,13 +1,6 @@
 #include "permute_op.hpp"
-#include "core/image.hpp"
 
 namespace Shadow {
-
-void PermuteOp::Setup() {
-  permute_order_data_ = get_repeated_argument<int>("order");
-  num_axes_ = static_cast<int>(permute_order_data_.size());
-  CHECK_EQ(num_axes_, bottoms<float>(0)->num_axes());
-}
 
 void PermuteOp::Reshape() {
   const auto *bottom = bottoms<float>(0);
@@ -54,15 +47,53 @@ void PermuteOp::Forward() {
   const auto *bottom = bottoms<float>(0);
   auto *top = mutable_tops<float>(0);
 
-  Image::Permute(bottom->data(), bottom->count(), bottom->num_axes(),
-                 permute_order_->data(), old_steps_->data(), new_steps_->data(),
-                 top->mutable_data());
-}
-
-void PermuteOp::Release() {
-  // DLOG(INFO) << "Free PermuteOp!";
+  Vision::Permute(bottom->data(), bottom->count(), bottom->num_axes(),
+                  permute_order_->data(), old_steps_->data(),
+                  new_steps_->data(), top->mutable_data());
 }
 
 REGISTER_OPERATOR(Permute, PermuteOp);
+
+namespace Vision {
+
+#if !defined(USE_CUDA) & !defined(USE_CL)
+template <typename T, typename Dtype>
+void Permute(const T *in_data, int count, int num_axes,
+             const Dtype *permute_order, const Dtype *old_steps,
+             const Dtype *new_steps, T *out_data) {
+  for (int i = 0; i < count; ++i) {
+    int old_idx = 0;
+    int idx = i;
+    for (int j = 0; j < num_axes; ++j) {
+      int order = permute_order[j];
+      old_idx += (idx / new_steps[j]) * old_steps[order];
+      idx %= new_steps[j];
+    }
+    out_data[i] = in_data[old_idx];
+  }
+}
+
+template void Permute(const float *in_data, int count, int num_axes,
+                      const int *permute_order, const int *old_steps,
+                      const int *new_steps, float *out_data);
+
+#elif defined(USE_CL)
+template <typename T, typename Dtype>
+void Permute(const T *in_data, int count, int num_axes,
+             const Dtype *permute_order, const Dtype *old_steps,
+             const Dtype *new_steps, T *out_data) {
+  size_t global = count;
+  auto *kernel = Kernel::cl_kernels_["Permute"];
+  kernel->SetArguments(*in_data, count, num_axes, *permute_order, *old_steps,
+                       *new_steps, *out_data);
+  kernel->Launch(*Kernel::queue_, {global}, Kernel::event_);
+  Kernel::queue_->Finish();
+}
+
+template void Permute(const BufferF *in_data, int count, int num_axes,
+                      const BufferI *permute_order, const BufferI *old_steps,
+                      const BufferI *new_steps, BufferF *out_data);
+#endif
+}
 
 }  // namespace Shadow

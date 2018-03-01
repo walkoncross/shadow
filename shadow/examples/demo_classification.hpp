@@ -17,9 +17,8 @@ class DemoClassification {
   }
   ~DemoClassification() { Release(); }
 
-  void Setup(const std::string &model_file, const VecInt &classes,
-             const VecInt &in_shape) {
-    method_->Setup(model_file, classes, in_shape);
+  void Setup(const VecString &model_files, const VecInt &in_shape) {
+    method_->Setup(model_files, in_shape);
   }
   void Release() {
     if (method_ != nullptr) {
@@ -35,6 +34,12 @@ class DemoClassification {
                std::vector<std::map<std::string, VecFloat>> *scores) {
     method_->Predict(im_src, rois, scores);
   }
+#if defined(USE_OpenCV)
+  void Predict(const cv::Mat &im_mat, const VecRectF &rois,
+               std::vector<std::map<std::string, VecFloat>> *scores) {
+    method_->Predict(im_mat, rois, scores);
+  }
+#endif
 
  private:
   void PrintDetections(

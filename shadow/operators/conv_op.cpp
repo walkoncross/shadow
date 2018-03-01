@@ -1,51 +1,8 @@
 #include "conv_op.hpp"
-#include "core/blas.hpp"
-#include "core/image.hpp"
+
+#include "activate_op.hpp"
 
 namespace Shadow {
-
-void ConvOp::Setup() {
-  num_output_ = get_single_argument<int>("num_output", 0);
-  CHECK(has_argument("kernel_size"));
-  kernel_size_ = get_single_argument<int>("kernel_size", 0);
-  stride_ = get_single_argument<int>("stride", 1);
-  pad_ = get_single_argument<int>("pad", 0);
-  dilation_ = get_single_argument<int>("dilation", 1);
-  group_ = get_single_argument<int>("group", 1);
-  CHECK_EQ(bottoms<float>(0)->shape(1) % group_, 0);
-  CHECK_EQ(num_output_ % group_, 0);
-  bias_term_ = get_single_argument<bool>("bias_term", true);
-  activate_type_ = get_single_argument<int>("type", -1);
-  CHECK((activate_type_ == -1 || activate_type_ == 1))
-      << "Build in activate only support Relu";
-
-  if (bias_term_) {
-    CHECK_EQ(blobs_size(), 2);
-  } else {
-    CHECK_EQ(blobs_size(), 1);
-  }
-
-#if defined(USE_CUDNN)
-  use_cudnn_ = dilation_ == 1 && group_ == 1;
-  if (use_cudnn_) {
-    cudnn::createConvolutionDesc<float>(&conv_desc_);
-    cudnn::createTensor4dDesc<float>(&bottom_desc_);
-    cudnn::createTensor4dDesc<float>(&top_desc_);
-    cudnn::createFilterDesc<float>(&filter_desc_, num_output_,
-                                   bottoms<float>(0)->shape(1), kernel_size_,
-                                   kernel_size_);
-    if (bias_term_) {
-      cudnn::createTensor4dDesc<float>(&bias_desc_);
-      cudnn::setTensor4dDesc<float>(&bias_desc_, 1, num_output_, 1, 1);
-    }
-  }
-#endif
-
-#if defined(USE_NNPACK)
-  use_nnpack_ = bottoms<float>(0)->shape(0) == 1 && group_ == 1 &&
-                dilation_ == 1 && bias_term_;
-#endif
-}
 
 void ConvOp::Reshape() {
   const auto *bottom = bottoms<float>(0);
@@ -76,8 +33,8 @@ void ConvOp::Reshape() {
       biases_multiplier_->reshape({out_spatial_dim_});
       Blas::Set(out_spatial_dim_, 1, biases_multiplier_->mutable_data(), 0);
     }
-    col_image_ = op_ws_->CreateBlob<float>(op_name_ + "_col_image");
-    col_image_->reshape({kernel_dim_ * group_, out_spatial_dim_});
+    col_image_ = op_ws_->CreateTempBlob<float>(
+        {kernel_dim_ * group_, out_spatial_dim_}, op_name_ + "_col_image");
   }
 
 #if defined(USE_CUDNN)
@@ -153,7 +110,7 @@ void ConvOp::Forward() {
           top->mutable_data()));
     }
     if (activate_type_ == 1) {
-      Image::Activate(top->mutable_data(), top->count(), activate_type_);
+      Vision::Activate(top->mutable_data(), top->count(), activate_type_);
     }
     return;
   }
@@ -173,9 +130,9 @@ void ConvOp::Forward() {
 #endif
 
   for (int b = 0; b < batch; ++b) {
-    Image::Im2Col(bottom->data(), bottom->shape(), b * bottom_num, kernel_size_,
-                  stride_, pad_, dilation_, 0, top->shape(),
-                  col_image_->mutable_data());
+    Vision::Im2Col(bottom->data(), bottom->shape(), b * bottom_num,
+                   kernel_size_, stride_, pad_, dilation_, 0, top->shape(),
+                   col_image_->mutable_data());
     for (int g = 0; g < group_; ++g) {
       Blas::BlasSgemm(0, 0, num_output_ / group_, out_spatial_dim_, kernel_dim_,
                       1, blobs<float>(0)->data(), weight_offset_ * g,
@@ -189,42 +146,85 @@ void ConvOp::Forward() {
     }
   }
   if (activate_type_ == 1) {
-    Image::Activate(top->mutable_data(), top->count(), activate_type_);
+    Vision::Activate(top->mutable_data(), top->count(), activate_type_);
   }
-}
-
-void ConvOp::Release() {
-#if defined(USE_CUDNN)
-  if (conv_desc_ != nullptr) {
-    cudnnDestroyConvolutionDescriptor(conv_desc_);
-    conv_desc_ = nullptr;
-  }
-  if (bottom_desc_ != nullptr) {
-    cudnnDestroyTensorDescriptor(bottom_desc_);
-    bottom_desc_ = nullptr;
-  }
-  if (top_desc_ != nullptr) {
-    cudnnDestroyTensorDescriptor(top_desc_);
-    top_desc_ = nullptr;
-  }
-  if (filter_desc_ != nullptr) {
-    cudnnDestroyFilterDescriptor(filter_desc_);
-    filter_desc_ = nullptr;
-  }
-  if (bias_desc_ != nullptr) {
-    cudnnDestroyTensorDescriptor(bias_desc_);
-    bias_desc_ = nullptr;
-  }
-
-  if (workspace_ != nullptr) {
-    cudaFree(workspace_);
-    workspace_ = nullptr;
-  }
-#endif
-
-  // DLOG(INFO) << "Free ConvOp!";
 }
 
 REGISTER_OPERATOR(Conv, ConvOp);
+
+namespace Vision {
+
+#if !defined(USE_CUDA) & !defined(USE_CL)
+// check for 0 <= a < b
+inline bool check_border(int a, int b) {
+  return static_cast<unsigned>(a) < static_cast<unsigned>(b);
+}
+
+template <typename T>
+void Im2Col(const T *in_data, const VecInt &in_shape, int offset,
+            int kernel_size, int stride, int pad, int dilation, int zero_point,
+            const VecInt &out_shape, T *col_data) {
+  in_data += offset;
+  int in_c = in_shape[1], in_h = in_shape[2], in_w = in_shape[3];
+  int out_h = out_shape[2], out_w = out_shape[3];
+  int spatial_dim = in_h * in_w;
+  for (int k_c = 0; k_c < in_c; ++k_c, in_data += spatial_dim) {
+    for (int k_s = 0; k_s < kernel_size * kernel_size; ++k_s) {
+      int k_h = k_s / kernel_size;
+      int k_w = k_s % kernel_size;
+      int im_row = -pad + k_h * dilation;
+      for (int h = 0; h < out_h; ++h, im_row += stride) {
+        if (check_border(im_row, in_h)) {
+          int im_col = -pad + k_w * dilation;
+          for (int w = 0; w < out_w; ++w, im_col += stride) {
+            if (check_border(im_col, in_w)) {
+              *(col_data++) = in_data[im_row * in_w + im_col];
+            } else {
+              *(col_data++) = static_cast<T>(zero_point);
+            }
+          }
+        } else {
+          for (int w = 0; w < out_w; ++w) {
+            *(col_data++) = static_cast<T>(zero_point);
+          }
+        }
+      }
+    }
+  }
+}
+
+template void Im2Col(const float *in_data, const VecInt &in_shape, int offset,
+                     int kernel_size, int stride, int pad, int dilation,
+                     int zero_point, const VecInt &out_shape, float *col_data);
+template void Im2Col(const unsigned char *in_data, const VecInt &in_shape,
+                     int offset, int kernel_size, int stride, int pad,
+                     int dilation, int zero_point, const VecInt &out_shape,
+                     unsigned char *col_data);
+
+#elif defined(USE_CL)
+template <typename T>
+void Im2Col(const T *in_data, const VecInt &in_shape, int offset,
+            int kernel_size, int stride, int pad, int dilation, int zero_point,
+            const VecInt &out_shape, T *col_data) {
+  int in_c = in_shape[1], in_h = in_shape[2], in_w = in_shape[3];
+  int out_h = out_shape[2], out_w = out_shape[3];
+  int count = in_c * out_h * out_w;
+
+  size_t global = count;
+  auto *kernel = Kernel::cl_kernels_["Im2Col"];
+  kernel->SetArguments(*in_data, offset, count, in_c, in_h, in_w, kernel_size,
+                       stride, pad, dilation, zero_point, out_h, out_w,
+                       *col_data);
+  kernel->Launch(*Kernel::queue_, {global}, Kernel::event_);
+  Kernel::queue_->Finish();
+}
+
+template void Im2Col(const BufferF *in_data, const VecInt &in_shape, int offset,
+                     int kernel_size, int stride, int pad, int dilation,
+                     int zero_point, const VecInt &out_shape,
+                     BufferF *col_data);
+#endif
+
+}  // namespace Vision
 
 }  // namespace Shadow

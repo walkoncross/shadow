@@ -2,19 +2,33 @@
 
 namespace Shadow {
 
-void DetectionYOLO::Setup(const std::string &model_file, const VecInt &classes,
+void DetectionYOLO::Setup(const VecString &model_files,
                           const VecInt &in_shape) {
   net_.Setup();
 
-  net_.LoadModel(model_file, in_shape);
+  net_.LoadModel(model_files[0]);
 
-  batch_ = net_.in_shape()[0];
-  in_c_ = net_.in_shape()[1];
-  in_h_ = net_.in_shape()[2];
-  in_w_ = net_.in_shape()[3];
+  auto data_shape = net_.GetBlobByName<float>("data")->shape();
+  CHECK_EQ(data_shape.size(), 4);
+  CHECK_EQ(in_shape.size(), 1);
+  if (data_shape[0] != in_shape[0]) {
+    data_shape[0] = in_shape[0];
+    std::map<std::string, VecInt> shape_map;
+    shape_map["data"] = data_shape;
+    net_.Reshape(shape_map);
+  }
+
+  const auto &out_blob = net_.out_blob();
+  CHECK_EQ(out_blob.size(), 1);
+  out_str_ = out_blob[0];
+
+  batch_ = data_shape[0];
+  in_c_ = data_shape[1];
+  in_h_ = data_shape[2];
+  in_w_ = data_shape[3];
   in_num_ = in_c_ * in_h_ * in_w_;
-  out_num_ = net_.GetBlobByName<float>("out_blob")->num();
-  out_hw_ = net_.GetBlobByName<float>("out_blob")->shape(2);
+  out_num_ = net_.GetBlobByName<float>(out_str_)->num();
+  out_hw_ = net_.GetBlobByName<float>(out_str_)->shape(2);
 
   in_data_.resize(batch_ * in_num_);
   out_data_.resize(batch_ * out_num_);
@@ -22,25 +36,25 @@ void DetectionYOLO::Setup(const std::string &model_file, const VecInt &classes,
   biases_ = VecFloat{1.08f,  1.19f, 3.42f, 4.41f,  6.63f,
                      11.38f, 9.42f, 5.11f, 16.62f, 10.52f};
   threshold_ = 0.6;
-  num_classes_ = classes[0];
+  num_classes_ = net_.num_class()[0];
   num_km_ = 5;
 }
 
 void DetectionYOLO::Predict(const JImage &im_src, const VecRectF &rois,
-                            std::vector<VecBoxF> *Bboxes) {
+                            std::vector<VecBoxF> *Gboxes,
+                            std::vector<std::vector<VecPointF>> *Gpoints) {
   CHECK_LE(rois.size(), batch_);
   for (int b = 0; b < rois.size(); ++b) {
     ConvertData(im_src, in_data_.data() + b * in_num_, rois[b], in_c_, in_h_,
                 in_w_, 0);
   }
 
-  Process(in_data_.data(), Bboxes);
+  Process(in_data_, Gboxes);
 
-  CHECK_EQ(Bboxes->size(), rois.size());
-  for (int b = 0; b < Bboxes->size(); ++b) {
+  CHECK_EQ(Gboxes->size(), rois.size());
+  for (int b = 0; b < Gboxes->size(); ++b) {
     float height = rois[b].h, width = rois[b].w;
-    VecBoxF &boxes = Bboxes->at(b);
-    for (auto &box : boxes) {
+    for (auto &box : Gboxes->at(b)) {
       box.xmin *= width;
       box.xmax *= width;
       box.ymin *= height;
@@ -51,30 +65,47 @@ void DetectionYOLO::Predict(const JImage &im_src, const VecRectF &rois,
 
 #if defined(USE_OpenCV)
 void DetectionYOLO::Predict(const cv::Mat &im_mat, const VecRectF &rois,
-                            std::vector<VecBoxF> *Bboxes) {
-  im_ini_.FromMat(im_mat, true);
-  Predict(im_ini_, rois, Bboxes);
+                            std::vector<VecBoxF> *Gboxes,
+                            std::vector<std::vector<VecPointF>> *Gpoints) {
+  CHECK_LE(rois.size(), batch_);
+  for (int b = 0; b < rois.size(); ++b) {
+    ConvertData(im_mat, in_data_.data() + b * in_num_, rois[b], in_c_, in_h_,
+                in_w_, 0);
+  }
+
+  Process(in_data_, Gboxes);
+
+  CHECK_EQ(Gboxes->size(), rois.size());
+  for (int b = 0; b < Gboxes->size(); ++b) {
+    float height = rois[b].h, width = rois[b].w;
+    for (auto &box : Gboxes->at(b)) {
+      box.xmin *= width;
+      box.xmax *= width;
+      box.ymin *= height;
+      box.ymax *= height;
+    }
+  }
 }
 #endif
 
-void DetectionYOLO::Release() {
-  net_.Release();
+void DetectionYOLO::Release() { net_.Release(); }
 
-  in_data_.clear(), out_data_.clear(), biases_.clear();
-}
+void DetectionYOLO::Process(const VecFloat &in_data,
+                            std::vector<VecBoxF> *Gboxes) {
+  std::map<std::string, float *> data_map;
+  data_map["data"] = const_cast<float *>(in_data.data());
 
-void DetectionYOLO::Process(const float *data, std::vector<VecBoxF> *Bboxes) {
-  net_.Forward(data);
+  net_.Forward(data_map);
 
-  memcpy(out_data_.data(), net_.GetBlobDataByName<float>("out_blob"),
+  memcpy(out_data_.data(), net_.GetBlobDataByName<float>(out_str_),
          out_data_.size() * sizeof(float));
 
-  Bboxes->clear();
+  Gboxes->clear();
   for (int b = 0; b < batch_; ++b) {
     VecBoxF boxes;
     ConvertDetections(out_data_.data() + b * out_num_, biases_.data(),
                       num_classes_, num_km_, out_hw_, threshold_, &boxes);
-    Bboxes->push_back(boxes);
+    Gboxes->push_back(boxes);
   }
 }
 

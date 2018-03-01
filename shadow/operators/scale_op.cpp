@@ -1,49 +1,6 @@
 #include "scale_op.hpp"
-#include "core/blas.hpp"
-#include "core/image.hpp"
 
 namespace Shadow {
-
-void ScaleOp::Setup() {
-  axis_ = get_single_argument<int>("axis", 1);
-  axis_ = bottoms<float>(0)->canonical_index(axis_);
-  num_axis_ = get_single_argument<int>("num_axis", 1);
-  CHECK_GE(num_axis_, -1);
-  bias_term_ = get_single_argument<bool>("bias_term", false);
-
-  if (bottoms_size() == 1 && blobs_size() == 0) {
-    int end_axis;
-    if (num_axis_ == -1) {
-      end_axis = bottoms<float>(0)->num_axes();
-    } else {
-      end_axis = axis_ + num_axis_;
-      CHECK_GE(bottoms<float>(0)->num_axes(), end_axis);
-    }
-    VecInt scale_shape;
-    for (int i = axis_; i < end_axis; ++i) {
-      scale_shape.push_back(bottoms<float>(0)->shape(i));
-    }
-    add_blobs<float>(op_name_ + "_param_scale");
-    auto *scale_blob = mutable_blobs<float>(0);
-    scale_blob->reshape(scale_shape);
-    Blas::Set(scale_blob->count(), 1, scale_blob->mutable_data(), 0);
-    DLOG(WARNING) << "Scale param is initialized with the default value 1";
-  }
-  scale_ =
-      bottoms_size() > 1 ? mutable_bottoms<float>(1) : mutable_blobs<float>(0);
-
-  if (bias_term_ && (bottoms_size() + blobs_size() > 2)) {
-    bias_param_id_ = blobs_size() - 1;
-  } else {
-    bias_param_id_ = blobs_size();
-    add_blobs<float>(op_name_ + "_param_bias");
-    auto *bias_blob = mutable_blobs<float>(bias_param_id_);
-    bias_blob->reshape(scale_->shape());
-    Blas::Set(bias_blob->count(), 0, bias_blob->mutable_data(), 0);
-    DLOG(WARNING) << "Bias param is initialized with the default value 0";
-  }
-  bias_ = mutable_blobs<float>(bias_param_id_);
-}
 
 void ScaleOp::Reshape() {
   const auto *bottom = bottoms<float>(0);
@@ -70,14 +27,45 @@ void ScaleOp::Forward() {
   const auto *bottom = bottoms<float>(0);
   auto *top = mutable_tops<float>(0);
 
-  Image::Scale(bottom->data(), bottom->count(), scale_->data(), bias_->data(),
-               scale_dim_, inner_dim_, top->mutable_data());
-}
-
-void ScaleOp::Release() {
-  // DLOG(INFO) << "Free ScaleOp!";
+  Vision::Scale(bottom->data(), bottom->count(), scale_->data(), bias_->data(),
+                scale_dim_, inner_dim_, top->mutable_data());
 }
 
 REGISTER_OPERATOR(Scale, ScaleOp);
+
+namespace Vision {
+
+#if !defined(USE_CUDA) & !defined(USE_CL)
+template <typename T>
+void Scale(const T *in_data, int count, const T *scale_data, const T *bias_data,
+           int scale_dim, int inner_dim, T *out_data) {
+  for (int i = 0; i < count; ++i) {
+    int index = (i / inner_dim) % scale_dim;
+    out_data[i] = in_data[i] * scale_data[index] + bias_data[index];
+  }
+}
+
+template void Scale(const float *in_data, int count, const float *scale_data,
+                    const float *bias_data, int scale_dim, int inner_dim,
+                    float *out_data);
+
+#elif defined(USE_CL)
+template <typename T>
+void Scale(const T *in_data, int count, const T *scale_data, const T *bias_data,
+           int scale_dim, int inner_dim, T *out_data) {
+  size_t global = count;
+  auto *kernel = Kernel::cl_kernels_["Scale"];
+  kernel->SetArguments(*in_data, count, *scale_data, *bias_data, scale_dim,
+                       inner_dim, *out_data);
+  kernel->Launch(*Kernel::queue_, {global}, Kernel::event_);
+  Kernel::queue_->Finish();
+}
+
+template void Scale(const BufferF *in_data, int count,
+                    const BufferF *scale_data, const BufferF *bias_data,
+                    int scale_dim, int inner_dim, BufferF *out_data);
+#endif
+
+}  // namespace Vision
 
 }  // namespace Shadow

@@ -1,6 +1,8 @@
 #ifndef SHADOW_EXAMPLES_DEMO_DETECTION_HPP
 #define SHADOW_EXAMPLES_DEMO_DETECTION_HPP
 
+#include "detection_faster_rcnn.hpp"
+#include "detection_mtcnn.hpp"
 #include "detection_ssd.hpp"
 #include "detection_yolo.hpp"
 
@@ -11,6 +13,10 @@ class DemoDetection {
   explicit DemoDetection(const std::string &method_name = "ssd") {
     if (method_name == "ssd") {
       method_ = new DetectionSSD();
+    } else if (method_name == "mtcnn") {
+      method_ = new DetectionMTCNN();
+    } else if (method_name == "faster") {
+      method_ = new DetectionFasterRCNN();
     } else if (method_name == "yolo") {
       method_ = new DetectionYOLO();
     } else {
@@ -19,9 +25,8 @@ class DemoDetection {
   }
   ~DemoDetection() { Release(); }
 
-  void Setup(const std::string &model_file, const VecInt &classes,
-             const VecInt &in_shape) {
-    method_->Setup(model_file, classes, in_shape);
+  void Setup(const VecString &model_files, const VecInt &in_shape) {
+    method_->Setup(model_files, in_shape);
   }
   void Release() {
     if (method_ != nullptr) {
@@ -39,9 +44,17 @@ class DemoDetection {
 #endif
 
   void Predict(const JImage &im_src, const VecRectF &rois,
-               std::vector<VecBoxF> *Bboxes) {
-    method_->Predict(im_src, rois, Bboxes);
+               std::vector<VecBoxF> *Gboxes,
+               std::vector<std::vector<VecPointF>> *Gpoints) {
+    method_->Predict(im_src, rois, Gboxes, Gpoints);
   }
+#if defined(USE_OpenCV)
+  void Predict(const cv::Mat &im_mat, const VecRectF &rois,
+               std::vector<VecBoxF> *Gboxes,
+               std::vector<std::vector<VecPointF>> *Gpoints) {
+    method_->Predict(im_mat, rois, Gboxes, Gpoints);
+  }
+#endif
 
  private:
 #if defined(USE_OpenCV)
@@ -56,7 +69,8 @@ class DemoDetection {
 
   Method *method_;
   JImage im_ini_;
-  std::vector<VecBoxF> Bboxes_;
+  std::vector<VecBoxF> Gboxes_;
+  std::vector<std::vector<VecPointF>> Gpoints_;
   Timer timer_;
 };
 

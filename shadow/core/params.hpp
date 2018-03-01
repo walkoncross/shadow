@@ -220,7 +220,10 @@ class NetParam {
   }
 
   OPTIONAL_FIELD_DEFAULT_FUNC(name, std::string, "");
+  REPEATED_FIELD_FUNC(num_class, int);
+  REPEATED_FIELD_FUNC(out_blob, std::string);
   REPEATED_FIELD_FUNC(op, OpParam);
+  REPEATED_FIELD_FUNC(arg, Argument);
 
   void Clear() {
     clear_name();
@@ -229,7 +232,10 @@ class NetParam {
 
  private:
   std::string name_{"None"};
+  std::vector<int> num_class_;
+  std::vector<std::string> out_blob_;
   std::vector<OpParam> op_;
+  std::vector<Argument> arg_;
   bool has_name_{false};
 };
 
@@ -239,6 +245,7 @@ class NetParam {
 class ArgumentHelper {
  public:
   ArgumentHelper() = default;
+  explicit ArgumentHelper(const shadow::NetParam &def);
   explicit ArgumentHelper(const shadow::OpParam &def);
 
   bool HasArgument(const std::string &name) const;
@@ -254,7 +261,7 @@ class ArgumentHelper {
       const std::vector<T> &default_value = std::vector<T>()) const;
 
  private:
-  std::map<std::string, const shadow::Argument *> arg_map_;
+  std::map<std::string, shadow::Argument> arg_map_;
 };
 
 #define INSTANTIATE_SET_SINGLE_ARGUMENT(T, fieldname)                    \

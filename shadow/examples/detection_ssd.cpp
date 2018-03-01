@@ -2,13 +2,6 @@
 
 namespace Shadow {
 
-inline void ClipBBox(const BoxF &bbox, BoxF *clip_bbox) {
-  clip_bbox->xmin = std::max(std::min(bbox.xmin, 1.f), 0.f);
-  clip_bbox->ymin = std::max(std::min(bbox.ymin, 1.f), 0.f);
-  clip_bbox->xmax = std::max(std::min(bbox.xmax, 1.f), 0.f);
-  clip_bbox->ymax = std::max(std::min(bbox.ymax, 1.f), 0.f);
-}
-
 template <typename T>
 inline bool SortScorePairDescend(const std::pair<float, T> &pair1,
                                  const std::pair<float, T> &pair2) {
@@ -35,7 +28,7 @@ inline void GetMaxScoreIndex(
   }
 }
 
-inline void ApplyNMSFast(const VecBoxF &bboxes, VecFloat &scores,
+inline void ApplyNMSFast(const VecBoxF &bboxes, const VecFloat &scores,
                          float score_threshold, float nms_threshold, int top_k,
                          VecInt *indices) {
   // Sanity check.
@@ -48,61 +41,79 @@ inline void ApplyNMSFast(const VecBoxF &bboxes, VecFloat &scores,
   // Do nms.
   indices->clear();
   while (!score_index_vec.empty()) {
-    std::stable_sort(score_index_vec.begin(), score_index_vec.end(),
-                     SortScorePairDescend<int>);
-    const int idx = score_index_vec.front().second;
-    for (int i = 1; i < score_index_vec.size(); ++i) {
-      float overlap = Boxes::IoU(bboxes[idx], bboxes[i]);
-      float scale = std::exp(-overlap * overlap / 0.5f);
-      score_index_vec[i].first *= scale;
-      scores[score_index_vec[i].second] *= scale;
+    int idx = score_index_vec.front().second;
+    bool keep = true;
+    for (auto id : *indices) {
+      if (keep) {
+        float overlap = Boxes::IoU(bboxes[idx], bboxes[id]);
+        keep = overlap <= nms_threshold;
+      } else {
+        break;
+      }
     }
-    indices->push_back(idx);
+    if (keep) {
+      indices->push_back(idx);
+    }
     score_index_vec.erase(score_index_vec.begin());
   }
 }
 
-void DetectionSSD::Setup(const std::string &model_file, const VecInt &classes,
-                         const VecInt &in_shape) {
+void DetectionSSD::Setup(const VecString &model_files, const VecInt &in_shape) {
   net_.Setup();
 
-  net_.LoadModel(model_file, in_shape);
+  net_.LoadModel(model_files[0]);
 
-  batch_ = net_.in_shape()[0];
-  in_c_ = net_.in_shape()[1];
-  in_h_ = net_.in_shape()[2];
-  in_w_ = net_.in_shape()[3];
+  auto data_shape = net_.GetBlobByName<float>("data")->shape();
+  CHECK_EQ(data_shape.size(), 4);
+  CHECK_EQ(in_shape.size(), 1);
+  if (data_shape[0] != in_shape[0]) {
+    data_shape[0] = in_shape[0];
+    std::map<std::string, VecInt> shape_map;
+    shape_map["data"] = data_shape;
+    net_.Reshape(shape_map);
+  }
+
+  const auto &out_blob = net_.out_blob();
+  CHECK_EQ(out_blob.size(), 3);
+  mbox_loc_str_ = out_blob[0];
+  mbox_conf_flatten_str_ = out_blob[1];
+  mbox_priorbox_str_ = out_blob[2];
+
+  batch_ = data_shape[0];
+  in_c_ = data_shape[1];
+  in_h_ = data_shape[2];
+  in_w_ = data_shape[3];
   in_num_ = in_c_ * in_h_ * in_w_;
 
   in_data_.resize(batch_ * in_num_);
 
   threshold_ = 0.6;
-  num_classes_ = classes[0];
-  num_priors_ = net_.GetBlobByName<float>("mbox_priorbox")->shape(2) / 4;
+  num_classes_ = net_.num_class()[0];
+  num_priors_ = net_.GetBlobByName<float>(mbox_priorbox_str_)->shape(2) / 4;
   num_loc_classes_ = 1;
   background_label_id_ = 0;
-  top_k_ = 400;
-  keep_top_k_ = 200;
+  top_k_ = 300;
+  keep_top_k_ = 300;
   nms_threshold_ = 0.45;
-  confidence_threshold_ = 0.01;
+  confidence_threshold_ = 0.15;
   share_location_ = true;
 }
 
 void DetectionSSD::Predict(const JImage &im_src, const VecRectF &rois,
-                           std::vector<VecBoxF> *Bboxes) {
+                           std::vector<VecBoxF> *Gboxes,
+                           std::vector<std::vector<VecPointF>> *Gpoints) {
   CHECK_LE(rois.size(), batch_);
   for (int b = 0; b < rois.size(); ++b) {
     ConvertData(im_src, in_data_.data() + b * in_num_, rois[b], in_c_, in_h_,
                 in_w_);
   }
 
-  Process(in_data_.data(), Bboxes);
+  Process(in_data_, Gboxes);
 
-  CHECK_EQ(Bboxes->size(), rois.size());
-  for (int b = 0; b < Bboxes->size(); ++b) {
+  CHECK_EQ(Gboxes->size(), rois.size());
+  for (int b = 0; b < Gboxes->size(); ++b) {
     float height = rois[b].h, width = rois[b].w;
-    auto &boxes = Bboxes->at(b);
-    for (auto &box : boxes) {
+    for (auto &box : Gboxes->at(b)) {
       box.xmin *= width;
       box.xmax *= width;
       box.ymin *= height;
@@ -113,24 +124,41 @@ void DetectionSSD::Predict(const JImage &im_src, const VecRectF &rois,
 
 #if defined(USE_OpenCV)
 void DetectionSSD::Predict(const cv::Mat &im_mat, const VecRectF &rois,
-                           std::vector<VecBoxF> *Bboxes) {
-  im_ini_.FromMat(im_mat, true);
-  Predict(im_ini_, rois, Bboxes);
+                           std::vector<VecBoxF> *Gboxes,
+                           std::vector<std::vector<VecPointF>> *Gpoints) {
+  CHECK_LE(rois.size(), batch_);
+  for (int b = 0; b < rois.size(); ++b) {
+    ConvertData(im_mat, in_data_.data() + b * in_num_, rois[b], in_c_, in_h_,
+                in_w_);
+  }
+
+  Process(in_data_, Gboxes);
+
+  CHECK_EQ(Gboxes->size(), rois.size());
+  for (int b = 0; b < Gboxes->size(); ++b) {
+    float height = rois[b].h, width = rois[b].w;
+    for (auto &box : Gboxes->at(b)) {
+      box.xmin *= width;
+      box.xmax *= width;
+      box.ymin *= height;
+      box.ymax *= height;
+    }
+  }
 }
 #endif
 
-void DetectionSSD::Release() {
-  net_.Release();
+void DetectionSSD::Release() { net_.Release(); }
 
-  in_data_.clear();
-}
+void DetectionSSD::Process(const VecFloat &in_data,
+                           std::vector<VecBoxF> *Gboxes) {
+  std::map<std::string, float *> data_map;
+  data_map["data"] = const_cast<float *>(in_data.data());
 
-void DetectionSSD::Process(const float *data, std::vector<VecBoxF> *Bboxes) {
-  net_.Forward(data);
+  net_.Forward(data_map);
 
-  const auto *loc_data = net_.GetBlobDataByName<float>("mbox_loc");
-  const auto *conf_data = net_.GetBlobDataByName<float>("mbox_conf_flatten");
-  const auto *prior_data = net_.GetBlobDataByName<float>("mbox_priorbox");
+  const auto *loc_data = net_.GetBlobDataByName<float>(mbox_loc_str_);
+  const auto *conf_data = net_.GetBlobDataByName<float>(mbox_conf_flatten_str_);
+  const auto *prior_data = net_.GetBlobDataByName<float>(mbox_priorbox_str_);
 
   VecLabelBBox all_loc_preds;
   GetLocPredictions(loc_data, batch_, num_priors_, num_loc_classes_,
@@ -152,7 +180,7 @@ void DetectionSSD::Process(const float *data, std::vector<VecBoxF> *Bboxes) {
   int num_kept = 0;
   std::vector<std::map<int, VecInt>> all_indices;
   for (int b = 0; b < batch_; ++b) {
-    auto &conf_scores = all_conf_scores[b];
+    const auto &conf_scores = all_conf_scores[b];
     const auto &decode_bboxes = all_decode_bboxes[b];
     std::map<int, VecInt> indices;
     int num_det = 0;
@@ -161,12 +189,13 @@ void DetectionSSD::Process(const float *data, std::vector<VecBoxF> *Bboxes) {
         continue;
       }
       if (conf_scores.find(c) == conf_scores.end()) {
-        LOG(FATAL) << "Could not find confidence predictions";
+        LOG(FATAL) << "Could not find confidence predictions for label " << c;
       }
-      auto &scores = conf_scores.find(c)->second;
+      const auto &scores = conf_scores.find(c)->second;
       int label = share_location_ ? -1 : c;
       if (decode_bboxes.find(label) == decode_bboxes.end()) {
-        LOG(FATAL) << "Could not find confidence predictions";
+        LOG(FATAL) << "Could not find confidence predictions for label "
+                   << label;
       }
       const auto &bboxes = decode_bboxes.find(label)->second;
       ApplyNMSFast(bboxes, scores, confidence_threshold_, nms_threshold_,
@@ -178,7 +207,7 @@ void DetectionSSD::Process(const float *data, std::vector<VecBoxF> *Bboxes) {
       for (const auto &it : indices) {
         int label = it.first;
         if (conf_scores.find(label) == conf_scores.end()) {
-          LOG(FATAL) << "Could not find confidence predictions";
+          LOG(FATAL) << "Could not find confidence predictions for" << label;
         }
         const auto &scores = conf_scores.find(label)->second;
         for (const auto &idx : it.second) {
@@ -206,7 +235,7 @@ void DetectionSSD::Process(const float *data, std::vector<VecBoxF> *Bboxes) {
     }
   }
 
-  Bboxes->clear();
+  Gboxes->clear();
   for (int b = 0; b < batch_; ++b) {
     VecBoxF boxes;
     const auto &conf_scores = all_conf_scores[b];
@@ -214,26 +243,26 @@ void DetectionSSD::Process(const float *data, std::vector<VecBoxF> *Bboxes) {
     for (const auto &it : all_indices[b]) {
       int label = it.first;
       if (conf_scores.find(label) == conf_scores.end()) {
-        LOG(FATAL) << "Could not find confidence predictions";
+        LOG(FATAL) << "Could not find confidence predictions for " << label;
       }
       const auto &scores = conf_scores.find(label)->second;
       int loc_label = share_location_ ? -1 : label;
       if (decode_bboxes.find(loc_label) == decode_bboxes.end()) {
-        LOG(FATAL) << "Could not find confidence predictions";
+        LOG(FATAL) << "Could not find confidence predictions for " << loc_label;
       }
       const auto &bboxes = decode_bboxes.find(loc_label)->second;
       for (const auto &idx : it.second) {
         float score = scores[idx];
         if (score > threshold_) {
           BoxF clip_bbox;
-          ClipBBox(bboxes[idx], &clip_bbox);
+          Boxes::Clip(bboxes[idx], &clip_bbox, 0.f, 1.f);
           clip_bbox.score = score;
           clip_bbox.label = label;
           boxes.push_back(clip_bbox);
         }
       }
     }
-    Bboxes->push_back(boxes);
+    Gboxes->push_back(boxes);
   }
 }
 
@@ -318,7 +347,7 @@ void DetectionSSD::DecodeBBoxesAll(const VecLabelBBox &all_loc_preds,
         continue;
       }
       if (all_loc_preds[i].find(label) == all_loc_preds[i].end()) {
-        LOG(FATAL) << "Could not find location predictions";
+        LOG(FATAL) << "Could not find location predictions for label " << label;
       }
       const auto &label_loc_preds = all_loc_preds[i].find(label)->second;
       DecodeBBoxes(prior_bboxes, prior_variances, label_loc_preds,

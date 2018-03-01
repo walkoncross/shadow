@@ -15,7 +15,7 @@ option(USE_JSON "Use JSON" OFF)
 option(USE_OpenCV "Use OpenCV to read, write and show image" ON)
 
 option(BUILD_EXAMPLES "Build examples" ON)
-option(BUILD_TOOLS "Build useful tools" ON)
+option(BUILD_TOOLS "Build useful tools" OFF)
 option(BUILD_SERVICE "Build grpc server and client" OFF)
 option(BUILD_TEST "Build test shadow" OFF)
 
@@ -27,8 +27,10 @@ set(OpenCV_DIR "/usr/local/opencv-3.3.0" CACHE PATH "OpenCV root directory")
 
 set(CMAKE_FIND_ROOT_PATH ${PROJECT_SOURCE_DIR})
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
-set(CMAKE_INSTALL_PREFIX ${CMAKE_BINARY_DIR}/distribute)
-set(CMAKE_INSTALL_RPATH ${CMAKE_INSTALL_PREFIX}/lib)
+if (NOT CMAKE_INSTALL_PREFIX)
+  message(STATUS "CMake install prefix not set - defaulting to ${CMAKE_BINARY_DIR}/distribute")
+  set(CMAKE_INSTALL_PREFIX ${CMAKE_BINARY_DIR}/distribute)
+endif ()
 
 if (NOT CMAKE_BUILD_TYPE)
   message(STATUS "Build type not set - defaulting to Release")

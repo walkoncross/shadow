@@ -3,21 +3,25 @@
   if (globalid >= count) return;
 
 __kernel void DataTransform(__global float *in_data, int count, int in_c,
-                            int spatial_dim, float scale, int num_mean,
-                            __global float *mean_value,
+                            int spatial_dim, int num_mean,
+                            __global float *mean_value, int num_scale,
+                            __global float *scale_value,
                             __global float *out_data) {
   CL_KERNEL_LOOP(globalid, count)
 
   int c_out = (globalid / spatial_dim) % in_c;
-  int s_out = globalid % spatial_dim;
 
-  if (num_mean == 1) {
-    out_data[globalid] = (in_data[globalid] - mean_value[0]) * scale;
-  } else if (num_mean == in_c) {
-    out_data[globalid] = (in_data[globalid] - mean_value[c_out]) * scale;
-  } else if (num_mean == in_c * spatial_dim) {
+  if (num_mean == 1 && num_scale == 1) {
+    out_data[globalid] = (in_data[globalid] - mean_value[0]) * scale_value[0];
+  } else if (num_mean == in_c && num_scale == 1) {
     out_data[globalid] =
-        (in_data[globalid] - mean_value[c_out * spatial_dim + s_out]) * scale;
+        (in_data[globalid] - mean_value[c_out]) * scale_value[0];
+  } else if (num_mean == 1 && num_scale == in_c) {
+    out_data[globalid] =
+        (in_data[globalid] - mean_value[0]) * scale_value[c_out];
+  } else if (num_mean == in_c && num_scale == in_c) {
+    out_data[globalid] =
+        (in_data[globalid] - mean_value[c_out]) * scale_value[c_out];
   }
 }
 
@@ -67,17 +71,17 @@ __kernel void Pooling(__global float *in_data, int count, int in_c, int in_h,
   kistart = max(kistart, 0), kjstart = max(kjstart, 0);
   kiend = min(kiend, in_h), kjend = min(kjend, in_w);
 
-  float max = -FLT_MAX;
-  float sum = 0.f;
+  in_data += (b_out * in_c + c_out) * in_h * in_w;
+
+  float max_val = -FLT_MAX, sum_val = 0.f;
   for (int ki = kistart; ki < kiend; ++ki) {
     for (int kj = kjstart; kj < kjend; ++kj) {
-      int index = kj + in_w * (ki + in_h * (c_out + in_c * b_out));
-      float value = in_data[index];
-      max = (value > max) ? value : max;
-      sum += value;
+      float value = in_data[ki * in_w + kj];
+      max_val = fmax(max_val, value);
+      sum_val += value;
     }
   }
-  out_data[globalid] = (mode == 0) ? max : sum / pool_size;
+  out_data[globalid] = (mode == 0) ? max_val : sum_val / pool_size;
 }
 
 __kernel void Concat(__global float *in_data, int count, int num_concats,
@@ -195,6 +199,104 @@ __kernel void LRN(__global float *in_data, int count,
 
   out_data[globalid] =
       in_data[globalid] * pow(scale_data[globalid], negative_beta);
+}
+
+__kernel void ROIPooling(__global float *in_data, int count,
+                         __global float *roi_data, int in_c, int in_h, int in_w,
+                         int pooled_h, int pooled_w, float spatial_scale,
+                         __global float *out_data) {
+  CL_KERNEL_LOOP(globalid, count)
+
+  int pw = globalid % pooled_w;
+  int ph = (globalid / pooled_w) % pooled_h;
+  int c = (globalid / pooled_w / pooled_h) % in_c;
+  int n = globalid / pooled_w / pooled_h / in_c;
+
+  roi_data += n * 5;
+  int roi_batch_id = roi_data[0];
+  int roi_start_w = round(roi_data[1] * spatial_scale);
+  int roi_start_h = round(roi_data[2] * spatial_scale);
+  int roi_end_w = round(roi_data[3] * spatial_scale);
+  int roi_end_h = round(roi_data[4] * spatial_scale);
+
+  int roi_height = max(roi_end_h - roi_start_h + 1, 1);
+  int roi_width = max(roi_end_w - roi_start_w + 1, 1);
+  float bin_size_h = roi_height / (float)pooled_h;
+  float bin_size_w = roi_width / (float)pooled_w;
+
+  int hstart = (int)floor(ph * bin_size_h);
+  int wstart = (int)floor(pw * bin_size_w);
+  int hend = (int)ceil((ph + 1) * bin_size_h);
+  int wend = (int)ceil((pw + 1) * bin_size_w);
+
+  hstart = min(max(hstart + roi_start_h, 0), in_h);
+  hend = min(max(hend + roi_start_h, 0), in_h);
+  wstart = min(max(wstart + roi_start_w, 0), in_w);
+  wend = min(max(wend + roi_start_w, 0), in_w);
+
+  bool is_empty = (hend <= hstart) || (wend <= wstart);
+
+  in_data += (roi_batch_id * in_c + c) * in_h * in_w;
+
+  float max_val = is_empty ? 0.f : in_data[hstart * in_w + wstart];
+  for (int h = hstart; h < hend; ++h) {
+    for (int w = wstart; w < wend; ++w) {
+      max_val = fmax(max_val, in_data[h * in_w + w]);
+    }
+  }
+  out_data[globalid] = max_val;
+}
+
+__kernel void Proposal(int count, __global float *anchor_data,
+                       __global float *score_data, __global float *delta_data,
+                       __global float *info_data, int in_h, int in_w,
+                       int num_anchors, int feat_stride, int min_size,
+                       __global float *proposal_data) {
+  CL_KERNEL_LOOP(globalid, count)
+
+  int n_out = globalid % num_anchors;
+  int w_out = (globalid / num_anchors) % in_w;
+  int h_out = globalid / num_anchors / in_w;
+
+  int spatial_dim = in_h * in_w;
+  int spatial_offset = h_out * in_w + w_out;
+  int delta_offset = n_out * 4 * spatial_dim + spatial_offset;
+  float min_box_size = min_size * info_data[2];
+
+  anchor_data += n_out * 4;
+  proposal_data += globalid * 6;
+
+  float score =
+      score_data[(num_anchors + n_out) * spatial_dim + spatial_offset];
+
+  float anchor_x = anchor_data[0] + w_out * feat_stride;
+  float anchor_y = anchor_data[1] + h_out * feat_stride;
+  float anchor_w = anchor_data[2] - anchor_data[0] + 1;
+  float anchor_h = anchor_data[3] - anchor_data[1] + 1;
+  float anchor_cx = anchor_x + (anchor_w - 1) * 0.5f;
+  float anchor_cy = anchor_y + (anchor_h - 1) * 0.5f;
+
+  float dx = delta_data[delta_offset];
+  float dy = delta_data[delta_offset + spatial_dim];
+  float dw = delta_data[delta_offset + spatial_dim * 2];
+  float dh = delta_data[delta_offset + spatial_dim * 3];
+
+  float pb_cx = anchor_cx + anchor_w * dx, pb_cy = anchor_cy + anchor_h * dy;
+  float pb_w = anchor_w * exp(dw), pb_h = anchor_h * exp(dh);
+
+  float pb_xmin = pb_cx - (pb_w - 1) * 0.5f;
+  float pb_ymin = pb_cy - (pb_h - 1) * 0.5f;
+  float pb_xmax = pb_cx + (pb_w - 1) * 0.5f;
+  float pb_ymax = pb_cy + (pb_h - 1) * 0.5f;
+
+  proposal_data[0] = fmin(fmax(pb_xmin, 0.f), info_data[1] - 1);
+  proposal_data[1] = fmin(fmax(pb_ymin, 0.f), info_data[0] - 1);
+  proposal_data[2] = fmin(fmax(pb_xmin, 0.f), info_data[1] - 1);
+  proposal_data[3] = fmin(fmax(pb_ymin, 0.f), info_data[0] - 1);
+  proposal_data[4] = score;
+  pb_w = proposal_data[2] - proposal_data[0] + 1;
+  pb_h = proposal_data[3] - proposal_data[1] + 1;
+  proposal_data[5] = (pb_w >= min_box_size) && (pb_h >= min_box_size);
 }
 
 inline float ActivateValue(float x, int type, float slope) {

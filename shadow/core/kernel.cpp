@@ -17,8 +17,8 @@ pthreadpool_t nnp_pthreadpool_ = nullptr;
 
 void Setup(int device_id) {
 #if defined(USE_NNPACK)
-  CHECK_EQ(nnp_initialize(), nnp_status_success);
   if (nnp_pthreadpool_ == nullptr) {
+    CHECK_EQ(nnp_initialize(), nnp_status_success);
     nnp_pthreadpool_ = pthreadpool_create(NumThreads);
     CHECK_NOTNULL(nnp_pthreadpool_);
   }
@@ -27,8 +27,8 @@ void Setup(int device_id) {
 
 void Release() {
 #if defined(USE_NNPACK)
-  CHECK_EQ(nnp_deinitialize(), nnp_status_success);
   if (nnp_pthreadpool_ != nullptr) {
+    CHECK_EQ(nnp_deinitialize(), nnp_status_success);
     pthreadpool_destroy(nnp_pthreadpool_);
     nnp_pthreadpool_ = nullptr;
   }
@@ -67,17 +67,17 @@ void Setup(int device_id) {
 
   cl_kernels_.set_kernel(program_blas, cl_blas_kernels);
 
-  const std::string cl_image("shadow/core/image.cl");
-  auto program_image =
-      EasyCL::Program(*context_, Util::read_text_from_file(cl_image));
-  program_image.Build(*device_, compiler_options);
+  const std::string cl_vision("shadow/core/vision.cl");
+  auto program_vision =
+      EasyCL::Program(*context_, Util::read_text_from_file(cl_vision));
+  program_vision.Build(*device_, compiler_options);
 
-  const std::vector<std::string> cl_image_kernels{
-      "DataTransform", "Im2Col",       "Pooling",  "Concat",
-      "Permute",       "Scale",        "Bias",     "Reorg",
-      "LRN",           "LRNFillScale", "Activate", "PRelu"};
+  const std::vector<std::string> cl_vision_kernels{
+      "DataTransform", "Im2Col",   "Pooling",  "Concat",       "Permute",
+      "Scale",         "Bias",     "Reorg",    "LRNFillScale", "LRN",
+      "ROIPooling",    "Proposal", "Activate", "PRelu"};
 
-  cl_kernels_.set_kernel(program_image, cl_image_kernels);
+  cl_kernels_.set_kernel(program_vision, cl_vision_kernels);
 
   clblasSetup();
 }

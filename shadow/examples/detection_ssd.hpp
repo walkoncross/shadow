@@ -10,14 +10,15 @@ class DetectionSSD final : public Method {
   DetectionSSD() = default;
   ~DetectionSSD() override { Release(); }
 
-  void Setup(const std::string &model_file, const VecInt &classes,
-             const VecInt &in_shape) override;
+  void Setup(const VecString &model_files, const VecInt &in_shape) override;
 
   void Predict(const JImage &im_src, const VecRectF &rois,
-               std::vector<VecBoxF> *Bboxes) override;
+               std::vector<VecBoxF> *Gboxes,
+               std::vector<std::vector<VecPointF>> *Gpoints) override;
 #if defined(USE_OpenCV)
   void Predict(const cv::Mat &im_mat, const VecRectF &rois,
-               std::vector<VecBoxF> *Bboxes) override;
+               std::vector<VecBoxF> *Gboxes,
+               std::vector<std::vector<VecPointF>> *Gpoints) override;
 #endif
 
   void Release() override;
@@ -26,7 +27,7 @@ class DetectionSSD final : public Method {
   using LabelBBox = std::map<int, VecBoxF>;
   using VecLabelBBox = std::vector<LabelBBox>;
 
-  void Process(const float *data, std::vector<VecBoxF> *Bboxes);
+  void Process(const VecFloat &in_data, std::vector<VecBoxF> *Gboxes);
 
   void GetLocPredictions(const float *loc_data, int num,
                          int num_preds_per_class, int num_loc_classes,
@@ -52,12 +53,12 @@ class DetectionSSD final : public Method {
 
   Network net_;
   VecFloat in_data_;
+  std::string mbox_loc_str_, mbox_conf_flatten_str_, mbox_priorbox_str_;
   int batch_, in_num_, in_c_, in_h_, in_w_;
   int num_classes_, num_priors_, num_loc_classes_, background_label_id_, top_k_,
       keep_top_k_;
   float threshold_, nms_threshold_, confidence_threshold_;
   bool share_location_;
-  JImage im_ini_;
 };
 
 }  // namespace Shadow

@@ -5,7 +5,7 @@ if (Protobuf_FOUND)
   if (MSVC)
     set_target_properties(proto PROPERTIES DEBUG_POSTFIX "d")
   endif ()
-  install(TARGETS proto DESTINATION lib)
+  install(TARGETS proto DESTINATION ${Shadow_INSTALL_LIB_PREFIX})
 
   set(Shadow_PROTO_LIB proto PARENT_SCOPE)
 endif ()
